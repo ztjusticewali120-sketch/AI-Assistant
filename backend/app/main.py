@@ -3,11 +3,14 @@ import os
 import re
 import json
 import uuid
-import sqlite3
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Literal
+
+import psycopg
+from psycopg.rows import dict_row
+from psycopg.errors import UniqueViolation
 
 from dotenv import load_dotenv
 from jose import jwt, JWTError
@@ -33,24 +36,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "auth.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 SECRET_KEY = os.getenv("AUTH_SECRET_KEY")
 ALGORITHM = "HS256"
 security = HTTPBearer(auto_error=False)
 
 
 def get_db():
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    return connection
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is missing.")
+
+    return psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row
+    )
 
 
 def init_database():
     with get_db() as db:
         db.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
                 username TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 created_at TEXT NOT NULL
@@ -60,29 +66,26 @@ def init_database():
         db.execute("""
             CREATE TABLE IF NOT EXISTS chats (
                 id TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL,
+                user_id BIGINT NOT NULL REFERENCES users(id)
+                    ON DELETE CASCADE,
                 title TEXT NOT NULL,
                 messages TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                FOREIGN KEY (user_id) REFERENCES users(id)
-                    ON DELETE CASCADE
+                updated_at TEXT NOT NULL
             )
         """)
 
         db.execute("""
             CREATE TABLE IF NOT EXISTS feedback (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                chat_id TEXT NOT NULL,
+                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id)
+                    ON DELETE CASCADE,
+                chat_id TEXT NOT NULL REFERENCES chats(id)
+                    ON DELETE CASCADE,
                 message_index INTEGER NOT NULL,
                 rating TEXT NOT NULL CHECK(rating IN ('good', 'bad')),
                 created_at TEXT NOT NULL,
-                UNIQUE(user_id, chat_id, message_index),
-                FOREIGN KEY (user_id) REFERENCES users(id)
-                    ON DELETE CASCADE,
-                FOREIGN KEY (chat_id) REFERENCES chats(id)
-                    ON DELETE CASCADE
+                UNIQUE(user_id, chat_id, message_index)
             )
         """)
 
@@ -121,7 +124,7 @@ def create_token(username: str) -> str:
     if not SECRET_KEY:
         raise HTTPException(
             status_code=500,
-            detail="AUTH_SECRET_KEY is missing from backend .env"
+            detail="AUTH_SECRET_KEY is missing."
         )
 
     expiry = datetime.now(timezone.utc) + timedelta(days=7)
@@ -162,7 +165,7 @@ def get_current_user(
 def get_current_user_id(username: str) -> int:
     with get_db() as db:
         user = db.execute(
-            "SELECT id FROM users WHERE username = ?",
+            "SELECT id FROM users WHERE username = %s",
             (username,)
         ).fetchone()
 
@@ -222,12 +225,12 @@ def signup(request: SignupRequest):
             detail="Username can only contain letters, numbers and underscores."
         )
 
-    with get_db() as db:
-        try:
+    try:
+        with get_db() as db:
             db.execute(
                 """
                 INSERT INTO users (username, password_hash, created_at)
-                VALUES (?, ?, ?)
+                VALUES (%s, %s, %s)
                 """,
                 (
                     username,
@@ -235,11 +238,11 @@ def signup(request: SignupRequest):
                     datetime.now(timezone.utc).isoformat()
                 )
             )
-        except sqlite3.IntegrityError:
-            raise HTTPException(
-                status_code=409,
-                detail="Username already exists."
-            )
+    except UniqueViolation:
+        raise HTTPException(
+            status_code=409,
+            detail="Username already exists."
+        )
 
     return {
         "token": create_token(username),
@@ -253,7 +256,7 @@ def login(request: LoginRequest):
 
     with get_db() as db:
         user = db.execute(
-            "SELECT * FROM users WHERE username = ?",
+            "SELECT * FROM users WHERE username = %s",
             (username,)
         ).fetchone()
 
@@ -277,9 +280,7 @@ def me(username: str = Depends(get_current_user)):
     return {"username": username}
 
 
-# =========================
 # PRIVATE CHAT HISTORY
-# =========================
 
 @app.get("/chats")
 def get_chats(username: str = Depends(get_current_user)):
@@ -290,7 +291,7 @@ def get_chats(username: str = Depends(get_current_user)):
             """
             SELECT id, title, messages, created_at, updated_at
             FROM chats
-            WHERE user_id = ?
+            WHERE user_id = %s
             ORDER BY updated_at DESC
             """,
             (user_id,)
@@ -323,7 +324,7 @@ def save_chat(
 
     with get_db() as db:
         existing = db.execute(
-            "SELECT user_id FROM chats WHERE id = ?",
+            "SELECT user_id FROM chats WHERE id = %s",
             (chat_id,)
         ).fetchone()
 
@@ -334,8 +335,8 @@ def save_chat(
             db.execute(
                 """
                 UPDATE chats
-                SET title = ?, messages = ?, updated_at = ?
-                WHERE id = ? AND user_id = ?
+                SET title = %s, messages = %s, updated_at = %s
+                WHERE id = %s AND user_id = %s
                 """,
                 (
                     request.title,
@@ -350,7 +351,7 @@ def save_chat(
                 """
                 INSERT INTO chats
                 (id, user_id, title, messages, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 """,
                 (
                     chat_id,
@@ -374,7 +375,7 @@ def delete_chat(
 
     with get_db() as db:
         result = db.execute(
-            "DELETE FROM chats WHERE id = ? AND user_id = ?",
+            "DELETE FROM chats WHERE id = %s AND user_id = %s",
             (chat_id, user_id)
         )
 
@@ -384,9 +385,7 @@ def delete_chat(
     return {"message": "Chat deleted."}
 
 
-# =========================
 # RESPONSE FEEDBACK
-# =========================
 
 @app.post("/chats/{chat_id}/feedback")
 def save_feedback(
@@ -398,7 +397,7 @@ def save_feedback(
 
     with get_db() as db:
         chat = db.execute(
-            "SELECT messages FROM chats WHERE id = ? AND user_id = ?",
+            "SELECT messages FROM chats WHERE id = %s AND user_id = %s",
             (chat_id, user_id)
         ).fetchone()
 
@@ -420,11 +419,11 @@ def save_feedback(
             """
             INSERT INTO feedback
             (user_id, chat_id, message_index, rating, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT(user_id, chat_id, message_index)
             DO UPDATE SET
-                rating = excluded.rating,
-                created_at = excluded.created_at
+                rating = EXCLUDED.rating,
+                created_at = EXCLUDED.created_at
             """,
             (
                 user_id,
@@ -438,9 +437,7 @@ def save_feedback(
     return {"message": "Feedback saved.", "rating": request.rating}
 
 
-# =========================
 # AI CHAT
-# =========================
 
 @app.post("/chat")
 def chat(request: ChatRequest):
